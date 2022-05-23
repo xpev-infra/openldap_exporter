@@ -49,4 +49,4 @@ cross-compile:
 
 .PHONY: image
 image:
-	docker build -t openldap-exporter:1.0.0 .
+	docker build -t openldap-exporter:1.0.0 --platform=linux/amd64 .
