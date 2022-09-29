@@ -85,10 +85,8 @@ func main() {
 			EnvVars: []string{"JSON_LOG"},
 		}),
 		altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
-			Name:  replicationObject,
-			Usage: "Object to watch replication upon",
-			Value: cli.NewStringSlice("dc=xiaopeng,dc=com"),
-
+			Name:    replicationObject,
+			Usage:   "Object to watch replication upon",
 			EnvVars: []string{"REPLICATION_OBJECT"},
 		}),
 		&cli.StringFlag{
