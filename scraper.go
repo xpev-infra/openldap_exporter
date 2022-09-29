@@ -302,29 +302,9 @@ func (s *Scraper) scrape() bool {
 		if q.searchAttr == monitorReplicationFilter {
 
 			if s.LdapSyncTimeDetal {
-				masterConn, err := ldap.Dial(s.Net, s.LdapSyncMasterAddr)
+				sr, err := s.queryMasterContext(q)
 				if err != nil {
-					s.log.WithError(err).Error("dial failed")
-					return false
-				}
-
-				defer masterConn.Close()
-
-				err = masterConn.Bind(s.User, s.Pass)
-				if err != nil {
-					s.log.WithError(err).Error("bind master failed")
-					return false
-				}
-
-				req := ldap.NewSearchRequest(
-					q.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-					q.searchFilter, []string{q.searchAttr}, nil,
-				)
-
-				sr, err := masterConn.Search(req)
-
-				if err != nil {
-					s.log.WithError(err).WithField("filter", req.Filter).Error("master search error")
+					s.log.WithError(err).Error("query master context error")
 					return false
 				}
 
@@ -333,6 +313,7 @@ func (s *Scraper) scrape() bool {
 					return false
 				}
 
+				// only handle the first entrie
 				entry := sr.Entries[0]
 				val := entry.GetAttributeValue(q.searchAttr)
 				if val == "" {
@@ -370,4 +351,28 @@ func (s *Scraper) scrapeQuery(conn *ldap.Conn, q *query) error {
 	}
 	q.setData(sr.Entries, q)
 	return nil
+}
+
+func (s *Scraper) queryMasterContext(q *query) (result *ldap.SearchResult, err error) {
+	masterConn, err := ldap.Dial(s.Net, s.LdapSyncMasterAddr)
+	if err != nil {
+		s.log.WithError(err).Error("dial master node failed")
+		return
+	}
+
+	defer masterConn.Close()
+
+	err = masterConn.Bind(s.User, s.Pass)
+	if err != nil {
+		s.log.WithError(err).Error("bind master failed")
+		return
+	}
+
+	req := ldap.NewSearchRequest(
+		q.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+		q.searchFilter, []string{q.searchAttr}, nil,
+	)
+
+	return masterConn.Search(req)
+
 }
