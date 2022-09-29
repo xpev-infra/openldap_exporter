@@ -30,11 +30,12 @@ const (
 )
 
 type query struct {
-	baseDN       string
-	searchFilter string
-	searchAttr   string
-	metric       *prometheus.GaugeVec
-	setData      func([]*ldap.Entry, *query)
+	baseDN           string
+	searchFilter     string
+	searchAttr       string
+	metric           *prometheus.GaugeVec
+	setData          func([]*ldap.Entry, *query)
+	RepolicateResult float64 // to save repolicate nodes update time
 }
 
 var (
@@ -143,7 +144,61 @@ func setValue(entries []*ldap.Entry, q *query) {
 	}
 }
 
+// parse ldap contextCSN column
+func parseContextCSN(val string, fields log.Fields) (gt, count float64, sid string, mod float64, err error) {
+	valueBuffer := strings.Split(val, "#")
+
+	t, err := time.Parse("20060102150405.999999Z", valueBuffer[0])
+	gt = float64(t.Unix())
+
+	if err != nil {
+		log.WithFields(fields).WithError(err).Warn("unexpected gt value")
+		return
+	}
+
+	count, err = strconv.ParseFloat(valueBuffer[1], 64)
+	if err != nil {
+		log.WithFields(fields).WithError(err).Warn("unexpected count value")
+		return
+	}
+	sid = valueBuffer[2]
+	mod, err = strconv.ParseFloat(valueBuffer[3], 64)
+	if err != nil {
+		log.WithFields(fields).WithError(err).Warn("unexpected mod value")
+		return
+	}
+
+	return
+}
+
 func setReplicationValue(entries []*ldap.Entry, q *query) {
+	for _, entry := range entries {
+		val := entry.GetAttributeValue(q.searchAttr)
+		if val == "" {
+			// not every entry will have this attribute
+			continue
+		}
+		fields := log.Fields{
+			"filter": q.searchFilter,
+			"attr":   q.searchAttr,
+			"value":  val,
+		}
+
+		gt, count, sid, mod, err := parseContextCSN(val, fields)
+		if err != nil {
+			continue
+		}
+
+		// save repolicate result
+		q.RepolicateResult = gt
+
+		q.metric.WithLabelValues(sid, "gt").Set(gt)
+		q.metric.WithLabelValues(sid, "count").Set(count)
+		q.metric.WithLabelValues(sid, "mod").Set(mod)
+	}
+}
+
+func setReplicationDelayValue(entries []*ldap.Entry, q *query) {
 	for _, entry := range entries {
 		val := entry.GetAttributeValue(q.searchAttr)
 		if val == "" {
@@ -161,32 +216,23 @@ func setReplicationValue(entries []*ldap.Entry, q *query) {
 			log.WithFields(fields).WithError(err).Warn("unexpected gt value")
 			continue
 		}
-		count, err := strconv.ParseFloat(valueBuffer[1], 64)
-		if err != nil {
-			log.WithFields(fields).WithError(err).Warn("unexpected count value")
-			continue
-		}
 		sid := valueBuffer[2]
-		mod, err := strconv.ParseFloat(valueBuffer[3], 64)
-		if err != nil {
-			log.WithFields(fields).WithError(err).Warn("unexpected mod value")
-			continue
-		}
+
 		q.metric.WithLabelValues(sid, "gt").Set(float64(gt.Unix()))
-		q.metric.WithLabelValues(sid, "count").Set(count)
-		q.metric.WithLabelValues(sid, "mod").Set(mod)
 	}
 }
 
 type Scraper struct {
-	Net      string
-	Addr     string
-	User     string
-	Pass     string
-	Tick     time.Duration
-	LdapSync []string
-	log      log.FieldLogger
-	Sync     []string
+	Net                string
+	Addr               string
+	User               string
+	Pass               string
+	Tick               time.Duration
+	LdapSync           []string
+	log                log.FieldLogger
+	Sync               []string
+	LdapSyncTimeDetal  bool
+	LdapSyncMasterAddr string
 }
 
 func (s *Scraper) addReplicationQueries() {
@@ -246,15 +292,74 @@ func (s *Scraper) scrape() bool {
 
 	ret := true
 	for _, q := range queries {
-		if err := scrapeQuery(conn, q); err != nil {
-			s.log.WithError(err).WithField("filter", q.searchFilter).Warn("query failed")
+		if err := s.scrapeQuery(conn, q); err != nil {
+
+			s.log.WithError(err).WithField("filter", q.searchFilter).WithField("base_dn", q.baseDN).Warn("query failed")
 			ret = false
 		}
+
+		// add replicate nodes delay to master metrics
+		if q.searchAttr == monitorReplicationFilter {
+
+			if s.LdapSyncTimeDetal {
+				masterConn, err := ldap.Dial(s.Net, s.LdapSyncMasterAddr)
+				if err != nil {
+					s.log.WithError(err).Error("dial failed")
+					return false
+				}
+
+				defer masterConn.Close()
+
+				err = masterConn.Bind(s.User, s.Pass)
+				if err != nil {
+					s.log.WithError(err).Error("bind master failed")
+					return false
+				}
+
+				req := ldap.NewSearchRequest(
+					q.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+					q.searchFilter, []string{q.searchAttr}, nil,
+				)
+
+				sr, err := masterConn.Search(req)
+
+				if err != nil {
+					s.log.WithError(err).WithField("filter", req.Filter).Error("master search error")
+					return false
+				}
+
+				if len(sr.Entries) <= 0 {
+					s.log.Error("get master context csn error ,result empty")
+					return false
+				}
+
+				entry := sr.Entries[0]
+				val := entry.GetAttributeValue(q.searchAttr)
+				if val == "" {
+					// not every entry will have this attribute
+					continue
+				}
+
+				valueBuffer := strings.Split(val, "#")
+				gt, err := time.Parse("20060102150405.999999Z", valueBuffer[0])
+				if err != nil {
+					s.log.WithError(err).Error("time parser error,value=%s", valueBuffer[0])
+					return false
+				}
+				sid := valueBuffer[2]
+
+				// add delay to master metric
+				q.metric.WithLabelValues(sid, "delay").Set(float64(gt.Unix()) - q.RepolicateResult)
+			}
+
+		}
+
 	}
+
 	return ret
 }
 
-func scrapeQuery(conn *ldap.Conn, q *query) error {
+func (s *Scraper) scrapeQuery(conn *ldap.Conn, q *query) error {
 	req := ldap.NewSearchRequest(
 		q.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		q.searchFilter, []string{q.searchAttr}, nil,
